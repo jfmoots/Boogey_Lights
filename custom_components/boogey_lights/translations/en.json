@@ -1,0 +1,34 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Boogey Lights",
+        "description": "Select a discovered Boogey Lights GEN2 controller, or choose manual entry.",
+        "data": {
+          "selection": "Controller"
+        }
+      },
+      "manual": {
+        "title": "Boogey Lights manual setup",
+        "description": "Enter the BLE address for your Boogey Lights GEN2 controller.",
+        "data": {
+          "name": "Name",
+          "address": "BLE address"
+        }
+      },
+      "options": {
+        "title": "Name your Boogey Lights zones",
+        "description": "These names become the three Home Assistant light entities.",
+        "data": {
+          "name": "Name",
+          "zone_1_name": "Zone 1 name",
+          "zone_2_name": "Zone 2 name"
+        }
+      }
+    },
+    "error": {},
+    "abort": {
+      "already_configured": "This Boogey Lights controller is already configured."
+    }
+  }
+}
