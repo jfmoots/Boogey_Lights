@@ -1,23 +1,23 @@
 # Boogey Lights Home Assistant Integration
 
-## Version 1.0.0 – Protocol Conquered
+## Overview
 
 A Home Assistant custom integration for Boogey Lights GEN2 Bluetooth controllers.
 
-### Features
+This integration provides native Home Assistant and Apple Home control of Boogey Lights RGB systems including colors, brightness, effects, zone control, controller recovery, and persistent Bluetooth connectivity.
 
-- Automatic Bluetooth discovery
-- Home Assistant config flow
-- Apple Home / HomeKit compatible
-- Independent Driver and Passenger side control
-- All-zones control
+## Features
+
+- Bluetooth discovery and config flow
+- Driver Side, Passenger Side, and All Zones entities
 - RGB color control
 - Brightness control
 - Native Boogey effects
-- Automatic controller state recovery
-- Persistent BLE connection for near-instant response
+- Apple Home / HomeKit compatibility
+- Automatic controller recovery
+- Persistent BLE connection for fast response
 
-### Supported Effects
+## Supported Effects
 
 - Steady
 - Single Color Strobe
@@ -27,33 +27,23 @@ A Home Assistant custom integration for Boogey Lights GEN2 Bluetooth controllers
 - 7 Color Breathing
 - 7 Color Morphing
 
-### Reverse Engineering Highlights
+## Installation
 
-Decoded command families:
+1. Download the latest release.
+2. Copy the `custom_components/boogey_lights` directory into your Home Assistant `custom_components` folder.
+3. Restart Home Assistant.
+4. Add the integration from Settings → Devices & Services.
+5. Select the discovered Boogey controller.
 
-0x10 = Power OFF
-0x11 = Power ON
+## HomeKit Support
 
-0x20 = Zone 1 RGB OFF
-0x21 = Zone 1 RGB ON
+The integration exposes standard Light entities compatible with Apple Home through the Home Assistant HomeKit Bridge.
 
-0x30 = Zone 2 RGB OFF
-0x31 = Zone 2 RGB ON
+## Known Tested Hardware
 
-0x40 = All RGB OFF
-0x41 = All RGB ON
+- Boogey Lights GEN2 Bluetooth Controller
+- Dual-zone RGB underglow installation
 
-### Version 1.0.0 Milestone
+## Version 1.0.0
 
-- Stable BLE communications
-- Persistent BLE connection
-- Fast HomeKit response
-- Recovery from RGB-disabled controller states
-- Full color, brightness, and effect control
-- Production-ready daily use
-
-### Credits
-
-Reverse engineered and validated on a real-world RV installation.
-
-All your base are belong to us.
+First production-ready release.
