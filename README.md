@@ -1,49 +1,94 @@
-# Boogey Lights Home Assistant Integration
+Boogey Lights Home Assistant Integration
+Native Home Assistant integration for Boogey Lights GEN2 Bluetooth RGB controllers.
+Control your Boogey Lights directly from Home Assistant and Apple Home without relying on the Boogey mobile application.
+Features
+Lighting Control
+• RGB color control
+• Brightness control
+• On/Off control
+• Driver Side zone control
+• Passenger Side zone control
+• All Zones control
 
-## Overview
+Effects
+• Steady
+• Single Color Strobe
+• 7 Color Strobe
+• 7 Color Switching
+• Single Color Breathing
+• 7 Color Breathing
+• 7 Color Morphing
 
-A Home Assistant custom integration for Boogey Lights GEN2 Bluetooth controllers.
+Home Assistant Integration
+• Native Light entities
+• Bluetooth discovery
+• Config Flow setup
+• Persistent BLE connection
+• Fast command execution
+• Automatic reconnect handling
 
-This integration provides native Home Assistant and Apple Home control of Boogey Lights RGB systems including colors, brightness, effects, zone control, controller recovery, and persistent Bluetooth connectivity.
+Apple Home Support
+• Apple Home
+• Siri
+• Home Assistant dashboards
+• Home Assistant automations
+Tested Hardware
+Boogey Lights GEN2 Bluetooth Controller
+Dual-zone RGB underglow installation
+Installation
+Copy the integration folder into:
 
-## Features
+config/custom_components/boogey_lights/
 
-- Bluetooth discovery and config flow
-- Driver Side, Passenger Side, and All Zones entities
-- RGB color control
-- Brightness control
-- Native Boogey effects
-- Apple Home / HomeKit compatibility
-- Automatic controller recovery
-- Persistent BLE connection for fast response
+Restart Home Assistant.
 
-## Supported Effects
+Settings → Devices & Services → Add Integration → Boogey Lights
 
-- Steady
-- Single Color Strobe
-- 7 Color Strobe
-- 7 Color Switching
-- Single Color Breathing
-- 7 Color Breathing
-- 7 Color Morphing
+Select the discovered controller and complete setup.
+Entities
+Driver Side
+Passenger Side
+All Zones
+HomeKit
+Compatible with the Home Assistant HomeKit Bridge.
 
-## Installation
+Supported:
+• Power
+• Brightness
+• Color selection
+Reverse Engineering Notes
+Decoded command families:
 
-1. Download the latest release.
-2. Copy the `custom_components/boogey_lights` directory into your Home Assistant `custom_components` folder.
-3. Restart Home Assistant.
-4. Add the integration from Settings → Devices & Services.
-5. Select the discovered Boogey controller.
+0x10 = Power OFF
+0x11 = Power ON
+0x20 = Zone 1 RGB OFF
+0x21 = Zone 1 RGB ON
+0x30 = Zone 2 RGB OFF
+0x31 = Zone 2 RGB ON
+0x40 = All RGB OFF
+0x41 = All RGB ON
 
-## HomeKit Support
+The integration automatically restores controller state and can recover from RGB-disabled conditions without requiring the Boogey mobile application.
+Version 1.0.0
+Major Milestones
 
-The integration exposes standard Light entities compatible with Apple Home through the Home Assistant HomeKit Bridge.
+• Bluetooth protocol decoded
+• RGB control implemented
+• Effect support implemented
+• Zone control implemented
+• HomeKit compatibility verified
+• Controller recovery implemented
+• Persistent BLE connection implemented
 
-## Known Tested Hardware
+This release is considered production-ready for daily use.
+Roadmap
+• Effect speed control
+• Preset support
+• Scene support
+• RSSI diagnostics
+• Connection metrics
+• HACS publication
+Acknowledgements
+Boogey Lights v1.0.0 — Protocol Conquered
 
-- Boogey Lights GEN2 Bluetooth Controller
-- Dual-zone RGB underglow installation
-
-## Version 1.0.0
-
-First production-ready release.
+All your base are belong to us.
