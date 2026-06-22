@@ -15,7 +15,7 @@ from .const import CMD_RGB, CMD_SYSTEM, HEADER, TAIL, WRITE_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
-IDLE_DISCONNECT_SECONDS = 0.0  # v0.4.0: keep the BLE session open; no idle disconnect
+IDLE_DISCONNECT_SECONDS = 0.0  # v1.0.0: keep the BLE session open; no idle disconnect
 
 
 def _clamp_byte(value: int) -> int:
@@ -123,7 +123,7 @@ class BoogeyState:
 class BoogeyClient:
     """Command client for Boogey Lights GEN2 controllers.
 
-    v0.4.0 keeps a persistent BLE connection open and performs a best-effort
+    v1.0.0 keeps a persistent BLE connection open and performs a best-effort
     background preconnect during integration setup. This reduces HomeKit
     spinning/timeouts caused by first-command BLE reconnects.
 
@@ -215,7 +215,7 @@ class BoogeyClient:
                 _LOGGER.debug("Boogey %s disconnect failed: %s", self.address, err)
 
     def _schedule_idle_disconnect(self) -> None:
-        # v0.4.0: persistent BLE. Do not intentionally disconnect after writes.
+        # v1.0.0: persistent BLE. Do not intentionally disconnect after writes.
         return
 
     async def _idle_disconnect_worker(self) -> None:
