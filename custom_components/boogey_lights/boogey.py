@@ -136,6 +136,10 @@ class BoogeyClient:
         self.hass = hass
         self.address = address
         self._lock = asyncio.Lock()
+        # A light operation is a multi-packet controller transaction. Keep the
+        # whole sequence serialized so OFF cannot land between Power ON and a
+        # later RGB-enable packet from an older ON operation.
+        self._operation_lock = asyncio.Lock()
         self._client: BleakClient | None = None
         self._idle_disconnect_task: asyncio.Task | None = None
         self._startup_connect_task: asyncio.Task | None = None
@@ -298,3 +302,92 @@ class BoogeyClient:
                 speed=speed,
             ),
         )
+
+    async def _run_transaction(self, label: str, steps: list[tuple[str, bytes]]) -> None:
+        """Run one logical controller operation without packet interleaving.
+
+        Home Assistant can cancel a script while it is waiting for a light
+        service. Once a controller transaction has started, finish it before
+        propagating cancellation so a partially applied ON sequence cannot be
+        left behind. A following shutdown will then run after it and win.
+        """
+
+        async def _worker() -> None:
+            async with self._operation_lock:
+                _LOGGER.debug("Boogey transaction start label=%s steps=%s", label, len(steps))
+                for step_label, packet in steps:
+                    await self._write_packet(step_label, packet)
+                _LOGGER.debug("Boogey transaction complete label=%s", label)
+
+        task = self.hass.loop.create_task(_worker())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            _LOGGER.debug("Boogey caller cancelled; finishing transaction label=%s", label)
+            try:
+                await asyncio.shield(task)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Boogey transaction failed after caller cancellation label=%s: %s", label, err)
+            raise
+
+    async def turn_on_transaction(
+        self,
+        *,
+        channel: int,
+        red: int,
+        green: int,
+        blue: int,
+        brightness: int,
+        effect: int = 1,
+        speed: int = 0,
+    ) -> None:
+        """Wake, explicitly enable, and program a target as one operation."""
+        state_args = {
+            "red": red,
+            "green": green,
+            "blue": blue,
+            "brightness": brightness,
+            "effect": effect,
+            "speed": speed,
+        }
+
+        if channel == 0:
+            # All is a bulk target, not an independent physical output. Reset
+            # both persistent zone-enable bits, then rebuild both zones.
+            steps = [
+                ("POWER_ON", power_packet(True)),
+                ("RGB_OFF ch=1 action=0x20", rgb_enable_packet(1, False)),
+                ("RGB_OFF ch=2 action=0x30", rgb_enable_packet(2, False)),
+                ("RGB_ON ch=1 action=0x21", rgb_enable_packet(1, True)),
+                ("RGB ch=1 normalized all state", rgb_packet(channel=1, **state_args)),
+                ("RGB_ON ch=2 action=0x31", rgb_enable_packet(2, True)),
+                ("RGB ch=2 normalized all state", rgb_packet(channel=2, **state_args)),
+            ]
+        else:
+            action = rgb_enable_action(channel, True)
+            steps = [
+                ("POWER_ON", power_packet(True)),
+                (f"RGB_ON ch={channel} action=0x{action:02X}", rgb_enable_packet(channel, True)),
+                (f"RGB ch={channel} normalized state", rgb_packet(channel=channel, **state_args)),
+            ]
+
+        await self._run_transaction(f"TURN_ON ch={channel}", steps)
+
+    async def turn_off_transaction(self, *, channel: int) -> None:
+        """Disable one zone, or deterministically shut down the controller."""
+        if channel == 0:
+            steps = [
+                ("RGB_OFF ch=1 action=0x20", rgb_enable_packet(1, False)),
+                ("RGB_OFF ch=2 action=0x30", rgb_enable_packet(2, False)),
+                ("RGB_OFF ch=0 action=0x40", rgb_enable_packet(0, False)),
+                ("POWER_OFF", power_packet(False)),
+            ]
+            label = "SHUTDOWN_ALL"
+        else:
+            action = rgb_enable_action(channel, False)
+            steps = [
+                (f"RGB_OFF ch={channel} action=0x{action:02X}", rgb_enable_packet(channel, False)),
+            ]
+            label = f"TURN_OFF ch={channel}"
+
+        await self._run_transaction(label, steps)

@@ -48,6 +48,7 @@ async def async_setup_entry(
     base_name = entry.data[CONF_NAME]
     zone_1_name = entry.data[CONF_ZONE_1_NAME]
     zone_2_name = entry.data[CONF_ZONE_2_NAME]
+    coordinator = BoogeyCoordinator(client)
 
     # Channel mapping learned from v0.1.9 diagnostics:
     #   channel 0 = all zones
@@ -55,11 +56,88 @@ async def async_setup_entry(
     #   channel 2 = driver-side zone
     async_add_entities(
         [
-            BoogeyLight(client, entry.entry_id, f"{base_name} All", CHANNEL_ALL, "all"),
-            BoogeyLight(client, entry.entry_id, f"{base_name} {zone_1_name}", CHANNEL_1, "zone_1"),
-            BoogeyLight(client, entry.entry_id, f"{base_name} {zone_2_name}", CHANNEL_2, "zone_2"),
+            BoogeyLight(coordinator, entry.entry_id, f"{base_name} All", CHANNEL_ALL, "all"),
+            BoogeyLight(coordinator, entry.entry_id, f"{base_name} {zone_1_name}", CHANNEL_1, "zone_1"),
+            BoogeyLight(coordinator, entry.entry_id, f"{base_name} {zone_2_name}", CHANNEL_2, "zone_2"),
         ]
     )
+
+
+class BoogeyCoordinator:
+    """One commanded-state model shared by all entities for a controller."""
+
+    def __init__(self, client: BoogeyClient) -> None:
+        self.client = client
+        self.states = {
+            CHANNEL_ALL: BoogeyState(),
+            CHANNEL_1: BoogeyState(),
+            CHANNEL_2: BoogeyState(),
+        }
+        self.entities: list[BoogeyLight] = []
+
+    def register(self, entity: "BoogeyLight") -> None:
+        self.entities.append(entity)
+
+    def is_on(self, channel: int) -> bool:
+        if channel == CHANNEL_ALL:
+            # All is on whenever any physical controller zone is on. Therefore
+            # All=off always means both physical zones are off.
+            return self.states[CHANNEL_1].is_on or self.states[CHANNEL_2].is_on
+        return self.states[channel].is_on
+
+    def cancel_pending(self, channel: int) -> None:
+        for entity in self.entities:
+            if channel == CHANNEL_ALL or entity._channel == channel:
+                entity._cancel_pending_rgb()
+
+    def notify(self) -> None:
+        for entity in self.entities:
+            if getattr(entity, "hass", None) is not None:
+                entity.async_write_ha_state()
+
+    @staticmethod
+    def _copy_rgb_state(source: BoogeyState, target: BoogeyState) -> None:
+        target.red = source.red
+        target.green = source.green
+        target.blue = source.blue
+        target.brightness = source.brightness
+        target.effect = source.effect
+        target.speed = source.speed
+
+    async def async_turn_on(self, channel: int) -> None:
+        state = self.states[channel]
+        await self.client.turn_on_transaction(
+            channel=channel,
+            red=state.red,
+            green=state.green,
+            blue=state.blue,
+            brightness=state.brightness,
+            effect=state.effect,
+            speed=state.speed,
+        )
+
+        if channel == CHANNEL_ALL:
+            for zone_channel in (CHANNEL_1, CHANNEL_2):
+                zone_state = self.states[zone_channel]
+                self._copy_rgb_state(state, zone_state)
+                zone_state.is_on = True
+            state.is_on = True
+        else:
+            state.is_on = True
+            self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+        self.notify()
+
+    async def async_turn_off(self, channel: int) -> None:
+        self.cancel_pending(channel)
+        await self.client.turn_off_transaction(channel=channel)
+        if channel == CHANNEL_ALL:
+            self.states[CHANNEL_ALL].is_on = False
+            self.states[CHANNEL_1].is_on = False
+            self.states[CHANNEL_2].is_on = False
+        else:
+            self.states[channel].is_on = False
+            self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+        self.notify()
 
 
 class BoogeyLight(LightEntity, RestoreEntity):
@@ -71,23 +149,24 @@ class BoogeyLight(LightEntity, RestoreEntity):
 
     def __init__(
         self,
-        client: BoogeyClient,
+        coordinator: BoogeyCoordinator,
         entry_id: str,
         name: str,
         channel: int,
         suffix: str,
     ) -> None:
-        self._client = client
+        self._coordinator = coordinator
         self._channel = channel
-        self._state = BoogeyState()
+        self._state = coordinator.states[channel]
         self._attr_name = name
         self._attr_unique_id = f"{entry_id}_{suffix}"
         self._pending_rgb_task: asyncio.Task | None = None
         self._pending_rgb_seq = 0
+        coordinator.register(self)
 
     @property
     def is_on(self) -> bool:
-        return self._state.is_on
+        return self._coordinator.is_on(self._channel)
 
     @property
     def brightness(self) -> int:
@@ -115,7 +194,10 @@ class BoogeyLight(LightEntity, RestoreEntity):
         if last_state is None:
             return
 
-        self._state.is_on = last_state.state == "on"
+        # All is a derived bulk target. Restoring its old on/off flag must not
+        # overwrite the separately restored physical-zone command memories.
+        if self._channel != CHANNEL_ALL:
+            self._state.is_on = last_state.state == "on"
 
         attrs = last_state.attributes
         rgb = attrs.get("rgb_color")
@@ -151,9 +233,9 @@ class BoogeyLight(LightEntity, RestoreEntity):
     async def _debounced_rgb_worker(self, seq: int) -> None:
         try:
             await asyncio.sleep(RGB_DEBOUNCE_SECONDS)
-            if seq != self._pending_rgb_seq or not self._state.is_on:
+            if seq != self._pending_rgb_seq or not self.is_on:
                 return
-            await self._send_rgb("DEBOUNCED_RGB")
+            await self._send_on_transaction("DEBOUNCED_NORMALIZED_STATE")
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001
@@ -162,7 +244,7 @@ class BoogeyLight(LightEntity, RestoreEntity):
             if seq == self._pending_rgb_seq:
                 self._pending_rgb_task = None
 
-    async def _send_rgb(self, reason: str) -> None:
+    async def _send_on_transaction(self, reason: str) -> None:
         _LOGGER.debug(
             "Boogey entity send_rgb reason=%s name=%s channel=%s rgb=(%s,%s,%s) brightness=%s effect=%s speed=%s",
             reason,
@@ -175,18 +257,10 @@ class BoogeyLight(LightEntity, RestoreEntity):
             self._state.effect,
             self._state.speed,
         )
-        await self._client.set_rgb(
-            channel=self._channel,
-            red=self._state.red,
-            green=self._state.green,
-            blue=self._state.blue,
-            brightness=self._state.brightness,
-            effect=self._state.effect,
-            speed=self._state.speed,
-        )
+        await self._coordinator.async_turn_on(self._channel)
 
     async def async_turn_on(self, **kwargs) -> None:
-        was_off = not self._state.is_on
+        was_off = not self.is_on
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs[ATTR_RGB_COLOR]
@@ -203,9 +277,6 @@ class BoogeyLight(LightEntity, RestoreEntity):
         if self._state.brightness <= 0:
             self._state.brightness = 255
 
-        self._state.is_on = True
-        self.async_write_ha_state()
-
         _LOGGER.debug(
             "Boogey entity turn_on name=%s channel=%s was_off=%s kwargs=%s rgb=(%s,%s,%s) brightness=%s effect=%s",
             self._attr_name,
@@ -220,18 +291,11 @@ class BoogeyLight(LightEntity, RestoreEntity):
         )
 
         if was_off:
-            # v0.3.1: Boogey has two layers of state:
-            #   0x11 = controller-level Power ON / wake / restore
-            #   0x21/0x31/0x41 = RGB enable for Zone 1 / Zone 2 / All
-            # Testing showed that if the official app leaves the controller in
-            # the grey-screen Power OFF state, RGB enable alone is not enough.
-            # So HA turn_on wakes the controller first, then enables the requested
-            # RGB channel, then sends the requested color/brightness/effect.
-            # Normal turn_off still uses only RGB OFF and does not send Power OFF.
+            # Every ON transaction explicitly wakes, enables, and programs the
+            # target. Never skip controller normalization based on restored HA
+            # state; the factory app/RF remote can change the real enable bits.
             self._cancel_pending_rgb()
-            await self._client.set_power(True)
-            await self._client.set_rgb_enabled(channel=self._channel, on=True)
-            await self._send_rgb("IMMEDIATE_POWER_ON_RGB_ENABLE_THEN_STATE")
+            await self._send_on_transaction("IMMEDIATE_NORMALIZED_TURN_ON")
             return
 
         # Color picker / brightness slider updates while already on: coalesce.
@@ -239,16 +303,13 @@ class BoogeyLight(LightEntity, RestoreEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         # OFF is high priority: cancel any queued color-wheel updates and send now.
-        self._cancel_pending_rgb()
+        self._coordinator.cancel_pending(self._channel)
         _LOGGER.debug(
             "Boogey entity turn_off name=%s channel=%s kwargs=%s",
             self._attr_name,
             self._channel,
             kwargs,
         )
-        # v0.3.0: turn off by sending the proven per-zone RGB OFF system action.
-        # This mirrors the official app's RGB OFF button and preserves the
-        # controller's higher-level power state.
-        await self._client.set_rgb_enabled(channel=self._channel, on=False)
-        self._state.is_on = False
-        self.async_write_ha_state()
+        # Individual zones use their proven RGB OFF action. All performs the
+        # complete deterministic shutdown, including master Power OFF.
+        await self._coordinator.async_turn_off(self._channel)

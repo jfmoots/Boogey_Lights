@@ -40,6 +40,8 @@ Supported Boogey lighting effects:
 - Fast command execution
 - Automatic reconnect handling
 - Automatic recovery from RGB-disabled controller states
+- Transactional controller operations
+- Shared All/Zone commanded-state synchronization
 
 ### Apple Home Support
 
@@ -137,7 +139,22 @@ The following command families were decoded:
 | `0x40` | All RGB OFF |
 | `0x41` | All RGB ON |
 
-The integration automatically restores controller state and can recover from RGB-disabled conditions without requiring the Boogey mobile application.
+The integration explicitly normalizes controller power and RGB-enable state on
+every ON operation. All OFF disables both zones and master power as one
+serialized transaction. The controller exposes no verified state telemetry, so
+Home Assistant reports the last successfully completed command rather than
+claiming to have read the controller.
+
+---
+
+## Version 1.1.0
+
+- Serializes complete multi-packet operations so ON and OFF cannot interleave.
+- Explicitly wakes and enables the target on every ON command.
+- Rebuilds both persistent zone-enable states for All ON.
+- Performs Zone 1 OFF, Zone 2 OFF, All OFF, and Power OFF for All shutdown.
+- Synchronizes All, Driver, and Passenger commanded state after successful
+  operations.
 
 ---
 
