@@ -52,7 +52,7 @@ async def async_setup_entry(
 
     # Channel mapping learned from v0.1.9 diagnostics:
     #   channel 0 = all zones
-    #   channel 1 = passenger/front/rear zone
+    #   channel 1 = passenger-side zone
     #   channel 2 = driver-side zone
     async_add_entities(
         [

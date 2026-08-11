@@ -8,7 +8,7 @@ CONF_DEVICE_NAME = "device_name"
 CONF_SELECTION = "selection"
 
 DEFAULT_NAME = "Boogey Lights"
-DEFAULT_ZONE_1_NAME = "Front Rear Passenger"
+DEFAULT_ZONE_1_NAME = "Passenger Side"
 DEFAULT_ZONE_2_NAME = "Driver Side"
 
 WRITE_UUID = "0000fff5-0000-1000-8000-00805f9b34fb"
