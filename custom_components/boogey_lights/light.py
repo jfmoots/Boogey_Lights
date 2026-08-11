@@ -36,7 +36,7 @@ _LOGGER = logging.getLogger(__name__)
 # The Boogey controller is slow enough that sending every intermediate color
 # creates a long BLE backlog. Debounce normal color/brightness/effect changes
 # and only send the latest requested state.
-RGB_DEBOUNCE_SECONDS = 0.60
+RGB_DEBOUNCE_SECONDS = 0.15
 
 
 async def async_setup_entry(
@@ -80,9 +80,9 @@ class BoogeyCoordinator:
 
     def is_on(self, channel: int) -> bool:
         if channel == CHANNEL_ALL:
-            # All is on whenever any physical controller zone is on. Therefore
-            # All=off always means both physical zones are off.
-            return self.states[CHANNEL_1].is_on or self.states[CHANNEL_2].is_on
+            # "All Zones on" has one unambiguous meaning: both physical zones
+            # are on. A partial state remains visible on the individual entity.
+            return self.states[CHANNEL_1].is_on and self.states[CHANNEL_2].is_on
         return self.states[channel].is_on
 
     def cancel_pending(self, channel: int) -> None:
@@ -106,6 +106,8 @@ class BoogeyCoordinator:
 
     async def async_turn_on(self, channel: int) -> None:
         state = self.states[channel]
+        zone_1_on = True if channel in (CHANNEL_ALL, CHANNEL_1) else self.states[CHANNEL_1].is_on
+        zone_2_on = True if channel in (CHANNEL_ALL, CHANNEL_2) else self.states[CHANNEL_2].is_on
         await self.client.turn_on_transaction(
             channel=channel,
             red=state.red,
@@ -114,6 +116,8 @@ class BoogeyCoordinator:
             brightness=state.brightness,
             effect=state.effect,
             speed=state.speed,
+            zone_1_on=zone_1_on,
+            zone_2_on=zone_2_on,
         )
 
         if channel == CHANNEL_ALL:
@@ -125,6 +129,22 @@ class BoogeyCoordinator:
         else:
             state.is_on = True
             self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+        self.notify()
+
+    async def async_update_rgb(self, channel: int) -> None:
+        state = self.states[channel]
+        await self.client.update_rgb_transaction(
+            channel=channel,
+            red=state.red,
+            green=state.green,
+            blue=state.blue,
+            brightness=state.brightness,
+            effect=state.effect,
+            speed=state.speed,
+        )
+        if channel == CHANNEL_ALL:
+            for zone_channel in (CHANNEL_1, CHANNEL_2):
+                self._copy_rgb_state(state, self.states[zone_channel])
         self.notify()
 
     async def async_turn_off(self, channel: int) -> None:
@@ -235,7 +255,7 @@ class BoogeyLight(LightEntity, RestoreEntity):
             await asyncio.sleep(RGB_DEBOUNCE_SECONDS)
             if seq != self._pending_rgb_seq or not self.is_on:
                 return
-            await self._send_on_transaction("DEBOUNCED_NORMALIZED_STATE")
+            await self._send_rgb_update("DEBOUNCED_RGB_STATE")
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001
@@ -258,6 +278,10 @@ class BoogeyLight(LightEntity, RestoreEntity):
             self._state.speed,
         )
         await self._coordinator.async_turn_on(self._channel)
+
+    async def _send_rgb_update(self, reason: str) -> None:
+        _LOGGER.debug("Boogey entity RGB-only update reason=%s name=%s channel=%s", reason, self._attr_name, self._channel)
+        await self._coordinator.async_update_rgb(self._channel)
 
     async def async_turn_on(self, **kwargs) -> None:
         was_off = not self.is_on
@@ -290,7 +314,7 @@ class BoogeyLight(LightEntity, RestoreEntity):
             self._state.effect,
         )
 
-        if was_off:
+        if was_off or not kwargs:
             # Every ON transaction explicitly wakes, enables, and programs the
             # target. Never skip controller normalization based on restored HA
             # state; the factory app/RF remote can change the real enable bits.
@@ -298,7 +322,13 @@ class BoogeyLight(LightEntity, RestoreEntity):
             await self._send_on_transaction("IMMEDIATE_NORMALIZED_TURN_ON")
             return
 
-        # Color picker / brightness slider updates while already on: coalesce.
+        # An explicit effect is typical of a scene/test button. Send its one
+        # RGB packet immediately. Color-wheel/slider streams still coalesce.
+        if ATTR_EFFECT in kwargs:
+            self._cancel_pending_rgb()
+            await self._send_rgb_update("IMMEDIATE_EXPLICIT_RGB_STATE")
+            return
+
         self._schedule_debounced_rgb()
 
     async def async_turn_off(self, **kwargs) -> None:

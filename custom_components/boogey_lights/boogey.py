@@ -16,6 +16,9 @@ from .const import CMD_RGB, CMD_SYSTEM, HEADER, TAIL, WRITE_UUID
 _LOGGER = logging.getLogger(__name__)
 
 IDLE_DISCONNECT_SECONDS = 0.0  # v1.0.0: keep the BLE session open; no idle disconnect
+# A successful GATT write only means the BLE packet was delivered. The GEN2
+# controller needs a short processing gap before the next system/RGB command.
+INTER_PACKET_DELAY_SECONDS = 0.25
 
 
 def _clamp_byte(value: int) -> int:
@@ -315,8 +318,10 @@ class BoogeyClient:
         async def _worker() -> None:
             async with self._operation_lock:
                 _LOGGER.debug("Boogey transaction start label=%s steps=%s", label, len(steps))
-                for step_label, packet in steps:
+                for index, (step_label, packet) in enumerate(steps):
                     await self._write_packet(step_label, packet)
+                    if index < len(steps) - 1:
+                        await asyncio.sleep(INTER_PACKET_DELAY_SECONDS)
                 _LOGGER.debug("Boogey transaction complete label=%s", label)
 
         task = self.hass.loop.create_task(_worker())
@@ -340,6 +345,8 @@ class BoogeyClient:
         brightness: int,
         effect: int = 1,
         speed: int = 0,
+        zone_1_on: bool = False,
+        zone_2_on: bool = False,
     ) -> None:
         """Wake, explicitly enable, and program a target as one operation."""
         state_args = {
@@ -352,34 +359,72 @@ class BoogeyClient:
         }
 
         if channel == 0:
-            # All is a bulk target, not an independent physical output. Reset
-            # both persistent zone-enable bits, then rebuild both zones.
+            # Use the controller's native All-enable and All-RGB commands. The
+            # processing delay between them is essential; a GATT response is
+            # not proof that the controller has processed the prior command.
             steps = [
                 ("POWER_ON", power_packet(True)),
-                ("RGB_OFF ch=1 action=0x20", rgb_enable_packet(1, False)),
-                ("RGB_OFF ch=2 action=0x30", rgb_enable_packet(2, False)),
-                ("RGB_ON ch=1 action=0x21", rgb_enable_packet(1, True)),
-                ("RGB ch=1 normalized all state", rgb_packet(channel=1, **state_args)),
-                ("RGB_ON ch=2 action=0x31", rgb_enable_packet(2, True)),
-                ("RGB ch=2 normalized all state", rgb_packet(channel=2, **state_args)),
+                ("RGB_ON ch=0 action=0x41", rgb_enable_packet(0, True)),
+                ("RGB ch=0 normalized all state", rgb_packet(channel=0, **state_args)),
             ]
         else:
-            action = rgb_enable_action(channel, True)
+            # Power ON restores the controller's persistent enable bits. Set
+            # both bits to HA's intended state before programming the target,
+            # so waking Passenger cannot unexpectedly resurrect Driver.
             steps = [
                 ("POWER_ON", power_packet(True)),
-                (f"RGB_ON ch={channel} action=0x{action:02X}", rgb_enable_packet(channel, True)),
+                (
+                    f"RGB_{'ON' if zone_1_on else 'OFF'} ch=1 action=0x{rgb_enable_action(1, zone_1_on):02X}",
+                    rgb_enable_packet(1, zone_1_on),
+                ),
+                (
+                    f"RGB_{'ON' if zone_2_on else 'OFF'} ch=2 action=0x{rgb_enable_action(2, zone_2_on):02X}",
+                    rgb_enable_packet(2, zone_2_on),
+                ),
                 (f"RGB ch={channel} normalized state", rgb_packet(channel=channel, **state_args)),
             ]
 
         await self._run_transaction(f"TURN_ON ch={channel}", steps)
 
+    async def update_rgb_transaction(
+        self,
+        *,
+        channel: int,
+        red: int,
+        green: int,
+        blue: int,
+        brightness: int,
+        effect: int = 1,
+        speed: int = 0,
+    ) -> None:
+        """Program an already-enabled target with one serialized RGB packet."""
+        await self._run_transaction(
+            f"UPDATE_RGB ch={channel}",
+            [
+                (
+                    f"RGB ch={channel} state update",
+                    rgb_packet(
+                        channel=channel,
+                        red=red,
+                        green=green,
+                        blue=blue,
+                        brightness=brightness,
+                        effect=effect,
+                        speed=speed,
+                    ),
+                )
+            ],
+        )
+
     async def turn_off_transaction(self, *, channel: int) -> None:
         """Disable one zone, or deterministically shut down the controller."""
         if channel == 0:
             steps = [
+                # Put the native All-OFF command first. Even if a later cleanup
+                # command is lost, the first accepted command darkens both zones.
+                ("RGB_OFF ch=0 action=0x40", rgb_enable_packet(0, False)),
                 ("RGB_OFF ch=1 action=0x20", rgb_enable_packet(1, False)),
                 ("RGB_OFF ch=2 action=0x30", rgb_enable_packet(2, False)),
-                ("RGB_OFF ch=0 action=0x40", rgb_enable_packet(0, False)),
                 ("POWER_OFF", power_packet(False)),
             ]
             label = "SHUTDOWN_ALL"

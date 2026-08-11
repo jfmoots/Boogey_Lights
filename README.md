@@ -147,6 +147,16 @@ claiming to have read the controller.
 
 ---
 
+## Version 1.1.1
+
+- Adds a controller-processing pause between commands in multi-packet operations.
+- Uses native All ON/OFF commands before per-zone cleanup.
+- Normalizes both persistent zone-enable bits whenever either zone is awakened.
+- Sends steady-state color changes as one immediate RGB packet.
+- Defines All Zones as on only when both physical zones are commanded on.
+
+---
+
 ## Version 1.1.0
 
 - Serializes complete multi-packet operations so ON and OFF cannot interleave.
