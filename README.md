@@ -36,7 +36,7 @@ Supported Boogey lighting effects:
 - Native Light entities
 - Bluetooth discovery
 - Config Flow setup
-- Persistent BLE connection
+- Warm BLE connection with automatic idle release
 - Fast command execution
 - Automatic reconnect handling
 - Automatic recovery from RGB-disabled controller states
@@ -144,6 +144,17 @@ every ON operation. All OFF disables both zones and master power as one
 serialized transaction. The controller exposes no verified state telemetry, so
 Home Assistant reports the last successfully completed command rather than
 claiming to have read the controller.
+
+---
+
+## Version 1.1.2
+
+- Releases the BLE connection after 60 seconds without a command.
+- Resets the idle timer after each successful write so command bursts continue
+  using one warm connection.
+- Applies the same idle release to the best-effort startup preconnection.
+- Prevents an indefinitely held BLE session from wedging the controller until
+  its 12-volt supply is power-cycled.
 
 ---
 

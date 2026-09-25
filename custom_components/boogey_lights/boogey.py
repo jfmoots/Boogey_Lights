@@ -15,7 +15,10 @@ from .const import CMD_RGB, CMD_SYSTEM, HEADER, TAIL, WRITE_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
-IDLE_DISCONNECT_SECONDS = 0.0  # v1.0.0: keep the BLE session open; no idle disconnect
+# Keep the session warm long enough for HomeKit command bursts, then release it.
+# The GEN2 controller can stop accepting new BLE sessions after a connection is
+# held indefinitely, and recovering it requires a controller power cycle.
+IDLE_DISCONNECT_SECONDS = 60.0
 # A successful GATT write only means the BLE packet was delivered. The GEN2
 # controller needs a short processing gap before the next system/RGB command.
 INTER_PACKET_DELAY_SECONDS = 0.25
@@ -126,9 +129,9 @@ class BoogeyState:
 class BoogeyClient:
     """Command client for Boogey Lights GEN2 controllers.
 
-    v1.0.0 keeps a persistent BLE connection open and performs a best-effort
-    background preconnect during integration setup. This reduces HomeKit
-    spinning/timeouts caused by first-command BLE reconnects.
+    A best-effort background connection during setup reduces HomeKit
+    spinning/timeouts on the first command. The connection is released after
+    a short idle period so the controller is not pinned to a stale BLE session.
 
     It uses the discovered per-zone RGB enable/disable system commands and
     sends controller Power ON before enabling RGB during light turn_on. Power
@@ -162,6 +165,7 @@ class BoogeyClient:
         try:
             async with self._lock:
                 await self._ensure_connected()
+                self._schedule_idle_disconnect()
             _LOGGER.info("Boogey startup BLE connection ready for %s", self.address)
         except Exception as err:  # noqa: BLE001
             # Do not fail integration setup if the controller is temporarily out
@@ -222,8 +226,9 @@ class BoogeyClient:
                 _LOGGER.debug("Boogey %s disconnect failed: %s", self.address, err)
 
     def _schedule_idle_disconnect(self) -> None:
-        # v1.0.0: persistent BLE. Do not intentionally disconnect after writes.
-        return
+        if self._idle_disconnect_task is not None:
+            self._idle_disconnect_task.cancel()
+        self._idle_disconnect_task = self.hass.loop.create_task(self._idle_disconnect_worker())
 
     async def _idle_disconnect_worker(self) -> None:
         try:

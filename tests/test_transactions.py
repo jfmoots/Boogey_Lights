@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 import unittest
 
@@ -38,6 +39,16 @@ class _FakeHass:
     @property
     def loop(self):
         return asyncio.get_running_loop()
+
+
+class _FakeBleakClient:
+    def __init__(self) -> None:
+        self.is_connected = True
+        self.disconnect_calls = 0
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self.is_connected = False
 
 
 class TransactionTests(unittest.IsolatedAsyncioTestCase):
@@ -115,6 +126,41 @@ class TransactionTests(unittest.IsolatedAsyncioTestCase):
             brightness=255,
         )
         self.assertEqual(self.labels, ["RGB ch=1 state update"])
+
+
+class IdleDisconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.original_idle_seconds = boogey.IDLE_DISCONNECT_SECONDS
+        self.client = BoogeyClient(_FakeHass(), "test-controller")
+
+    async def asyncTearDown(self) -> None:
+        boogey.IDLE_DISCONNECT_SECONDS = self.original_idle_seconds
+        await self.client.async_close()
+
+    async def test_idle_connection_is_released(self) -> None:
+        boogey.IDLE_DISCONNECT_SECONDS = 0
+        bleak_client = _FakeBleakClient()
+        self.client._client = bleak_client
+        self.client._last_write_monotonic = time.monotonic()
+
+        self.client._schedule_idle_disconnect()
+        await self.client._idle_disconnect_task
+
+        self.assertIsNone(self.client._client)
+        self.assertEqual(bleak_client.disconnect_calls, 1)
+
+    async def test_rescheduling_replaces_idle_timer(self) -> None:
+        boogey.IDLE_DISCONNECT_SECONDS = 60
+
+        self.client._schedule_idle_disconnect()
+        first_task = self.client._idle_disconnect_task
+        self.client._schedule_idle_disconnect()
+        second_task = self.client._idle_disconnect_task
+        await asyncio.sleep(0)
+
+        self.assertIsNot(first_task, second_task)
+        self.assertTrue(first_task.cancelled())
+        self.assertFalse(second_task.done())
 
 
 if __name__ == "__main__":
