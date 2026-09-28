@@ -42,6 +42,7 @@ Supported Boogey lighting effects:
 - Automatic recovery from RGB-disabled controller states
 - Transactional controller operations
 - Shared All/Zone commanded-state synchronization
+- Bounded cold-connect advertisement recovery
 
 ### Apple Home Support
 
@@ -144,6 +145,19 @@ every ON operation. All OFF disables both zones and master power as one
 serialized transaction. The controller exposes no verified state telemetry, so
 Home Assistant reports the last successfully completed command rather than
 claiming to have read the controller.
+
+---
+
+## Version 1.1.3
+
+- Waits up to 30 seconds for an idle controller to advertise before failing a
+  cold-connect command.
+- Applies one bounded deadline across discovery, connection retries, and the
+  GATT write so Home Assistant calls cannot hang indefinitely.
+- Keeps successful sessions warm for five minutes, allowing a shortly-before-
+  dusk preflight to carry into scheduled lighting startup.
+- Retains automatic idle release to avoid the long-held-session controller
+  lockup addressed in version 1.1.2.
 
 ---
 

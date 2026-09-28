@@ -15,10 +15,19 @@ from .const import CMD_RGB, CMD_SYSTEM, HEADER, TAIL, WRITE_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
-# Keep the session warm long enough for HomeKit command bursts, then release it.
+# Keep the session warm long enough for a scheduled preflight and the command
+# burst that follows, then release it. This is still intentionally finite: the
+# GEN2 controller can wedge when a BLE session is held indefinitely.
 # The GEN2 controller can stop accepting new BLE sessions after a connection is
 # held indefinitely, and recovering it requires a controller power cycle.
-IDLE_DISCONNECT_SECONDS = 60.0
+IDLE_DISCONNECT_SECONDS = 300.0
+# A controller that has been idle may not be present in Home Assistant's latest
+# connectable-device cache at the instant a command arrives. Wait for a fresh
+# advertisement, but put one deadline around discovery, connect, retries, and
+# the GATT write so callers never hang indefinitely.
+COLD_CONNECT_TIMEOUT_SECONDS = 30.0
+DISCOVERY_POLL_SECONDS = 1.0
+WRITE_ATTEMPTS = 3
 # A successful GATT write only means the BLE packet was delivered. The GEN2
 # controller needs a short processing gap before the next system/RGB command.
 INTER_PACKET_DELAY_SECONDS = 0.25
@@ -186,32 +195,61 @@ class BoogeyClient:
             self._idle_disconnect_task = None
         await self._disconnect()
 
-    async def _get_ble_device(self):
-        """Get the latest connectable BLEDevice from Home Assistant's Bluetooth manager."""
-        ble_device = bluetooth.async_ble_device_from_address(
-            self.hass,
-            self.address,
-            connectable=True,
-        )
-        if ble_device is None:
-            raise RuntimeError(
-                f"Boogey controller {self.address} is not currently reachable by a Home Assistant Bluetooth adapter/proxy"
+    async def _get_ble_device(self, deadline: float):
+        """Wait, within the operation deadline, for a connectable BLEDevice."""
+        waiting_logged = False
+        while True:
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass,
+                self.address,
+                connectable=True,
             )
-        return ble_device
+            if ble_device is not None:
+                if waiting_logged:
+                    _LOGGER.info("Boogey advertisement rediscovered for %s", self.address)
+                return ble_device
 
-    async def _ensure_connected(self) -> BleakClient:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Boogey controller {self.address} did not advertise through a connectable "
+                    f"Home Assistant Bluetooth adapter/proxy within "
+                    f"{COLD_CONNECT_TIMEOUT_SECONDS:.0f} seconds"
+                )
+
+            if not waiting_logged:
+                _LOGGER.info(
+                    "Boogey %s is not in the connectable-device cache; waiting for an advertisement",
+                    self.address,
+                )
+                waiting_logged = True
+            await asyncio.sleep(min(DISCOVERY_POLL_SECONDS, remaining))
+
+    async def _ensure_connected(self, deadline: float | None = None) -> BleakClient:
         if self._client is not None and self._client.is_connected:
             _LOGGER.debug("Boogey %s reusing existing BLE connection", self.address)
             return self._client
 
-        ble_device = await self._get_ble_device()
+        if deadline is None:
+            deadline = time.monotonic() + COLD_CONNECT_TIMEOUT_SECONDS
+
+        ble_device = await self._get_ble_device(deadline)
         _LOGGER.info("Boogey connect address=%s device=%s", self.address, ble_device)
         start = time.monotonic()
-        self._client = await establish_connection(
-            BleakClient,
-            ble_device,
-            self.address,
-        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"Boogey cold-connect deadline expired for {self.address}")
+        try:
+            async with asyncio.timeout(remaining):
+                self._client = await establish_connection(
+                    BleakClient,
+                    ble_device,
+                    self.address,
+                )
+        except TimeoutError as err:
+            raise RuntimeError(
+                f"Boogey controller {self.address} did not connect within the bounded cold-connect window"
+            ) from err
         _LOGGER.info("Boogey connected address=%s elapsed=%.2fs", self.address, time.monotonic() - start)
         return self._client
 
@@ -242,11 +280,20 @@ class BoogeyClient:
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Boogey %s idle disconnect worker failed: %s", self.address, err)
 
-    async def _write_packet_locked(self, label: str, packet: bytes) -> None:
-        client = await self._ensure_connected()
+    async def _write_packet_locked(self, label: str, packet: bytes, deadline: float) -> None:
+        client = await self._ensure_connected(deadline)
         _LOGGER.debug("Boogey TX label=%s address=%s packet=%s", label, self.address, hexstr(packet))
         start = time.monotonic()
-        await client.write_gatt_char(WRITE_UUID, packet, response=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"Boogey write deadline expired for {self.address} / {label}")
+        try:
+            async with asyncio.timeout(remaining):
+                await client.write_gatt_char(WRITE_UUID, packet, response=True)
+        except TimeoutError as err:
+            raise RuntimeError(
+                f"Boogey GATT write timed out for {self.address} / {label}"
+            ) from err
         self._last_write_monotonic = time.monotonic()
         _LOGGER.debug(
             "Boogey TX complete label=%s elapsed=%.2fs",
@@ -257,10 +304,11 @@ class BoogeyClient:
 
     async def _write_packet(self, label: str, packet: bytes) -> None:
         async with self._lock:
+            deadline = time.monotonic() + COLD_CONNECT_TIMEOUT_SECONDS
             last_error: Exception | None = None
-            for attempt in range(1, 4):
+            for attempt in range(1, WRITE_ATTEMPTS + 1):
                 try:
-                    await self._write_packet_locked(label, packet)
+                    await self._write_packet_locked(label, packet, deadline)
                     return
                 except Exception as err:  # noqa: BLE001
                     last_error = err
@@ -272,7 +320,10 @@ class BoogeyClient:
                         err,
                     )
                     await self._disconnect()
-                    await asyncio.sleep(0.25 * attempt)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(0.25 * attempt, remaining))
 
             assert last_error is not None
             raise last_error

@@ -163,5 +163,31 @@ class IdleDisconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second_task.done())
 
 
+class ColdConnectTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.original_poll_seconds = boogey.DISCOVERY_POLL_SECONDS
+        boogey.DISCOVERY_POLL_SECONDS = 0
+        self.client = BoogeyClient(_FakeHass(), "test-controller")
+
+    async def asyncTearDown(self) -> None:
+        boogey.DISCOVERY_POLL_SECONDS = self.original_poll_seconds
+        await self.client.async_close()
+
+    async def test_waits_for_fresh_advertisement(self) -> None:
+        expected_device = object()
+        discoveries = iter([None, None, expected_device])
+        bluetooth.async_ble_device_from_address = lambda *args, **kwargs: next(discoveries)
+
+        device = await self.client._get_ble_device(time.monotonic() + 1)
+
+        self.assertIs(device, expected_device)
+
+    async def test_discovery_wait_has_a_deadline(self) -> None:
+        bluetooth.async_ble_device_from_address = lambda *args, **kwargs: None
+
+        with self.assertRaisesRegex(RuntimeError, "did not advertise"):
+            await self.client._get_ble_device(time.monotonic())
+
+
 if __name__ == "__main__":
     unittest.main()
