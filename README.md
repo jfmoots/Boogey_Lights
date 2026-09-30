@@ -148,6 +148,20 @@ claiming to have read the controller.
 
 ---
 
+## Version 1.1.4
+
+- Adds a three-minute maximum BLE connection lifetime in addition to the
+  five-minute idle timeout.
+- Refreshes the connection at the next command after that limit, even while an
+  active effect is continually sending color updates.
+- Serializes each zone's commanded-state decision with its controller
+  transaction, preventing simultaneous scene starts from disabling the zone
+  that completed first.
+- Preserves the warm connection across the two-minute holiday-light preflight
+  while preventing a busy show from holding one session indefinitely.
+
+---
+
 ## Version 1.1.3
 
 - Waits up to 30 seconds for an idle controller to advertise before failing a

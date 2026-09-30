@@ -21,6 +21,10 @@ _LOGGER = logging.getLogger(__name__)
 # The GEN2 controller can stop accepting new BLE sessions after a connection is
 # held indefinitely, and recovering it requires a controller power cycle.
 IDLE_DISCONNECT_SECONDS = 300.0
+# Traffic during an active effect continually resets the idle timer. Cap the
+# total lifetime of a connection as well so a busy show cannot keep one BLE
+# session alive long enough for the GEN2 controller to wedge.
+MAX_CONNECTION_AGE_SECONDS = 180.0
 # A controller that has been idle may not be present in Home Assistant's latest
 # connectable-device cache at the instant a command arrives. Wait for a fresh
 # advertisement, but put one deadline around discovery, connect, retries, and
@@ -159,6 +163,7 @@ class BoogeyClient:
         self._idle_disconnect_task: asyncio.Task | None = None
         self._startup_connect_task: asyncio.Task | None = None
         self._last_write_monotonic: float = 0.0
+        self._connected_monotonic: float = 0.0
 
     def async_start(self) -> None:
         """Start a best-effort background BLE connection.
@@ -227,8 +232,20 @@ class BoogeyClient:
 
     async def _ensure_connected(self, deadline: float | None = None) -> BleakClient:
         if self._client is not None and self._client.is_connected:
-            _LOGGER.debug("Boogey %s reusing existing BLE connection", self.address)
-            return self._client
+            connection_age = time.monotonic() - self._connected_monotonic
+            if connection_age < MAX_CONNECTION_AGE_SECONDS:
+                _LOGGER.debug(
+                    "Boogey %s reusing existing BLE connection age=%.1fs",
+                    self.address,
+                    connection_age,
+                )
+                return self._client
+            _LOGGER.info(
+                "Boogey %s refreshing BLE connection after %.1fs",
+                self.address,
+                connection_age,
+            )
+            await self._disconnect()
 
         if deadline is None:
             deadline = time.monotonic() + COLD_CONNECT_TIMEOUT_SECONDS
@@ -250,12 +267,14 @@ class BoogeyClient:
             raise RuntimeError(
                 f"Boogey controller {self.address} did not connect within the bounded cold-connect window"
             ) from err
+        self._connected_monotonic = time.monotonic()
         _LOGGER.info("Boogey connected address=%s elapsed=%.2fs", self.address, time.monotonic() - start)
         return self._client
 
     async def _disconnect(self) -> None:
         client = self._client
         self._client = None
+        self._connected_monotonic = 0.0
         if client is not None and client.is_connected:
             try:
                 _LOGGER.debug("Boogey %s disconnecting idle BLE connection", self.address)

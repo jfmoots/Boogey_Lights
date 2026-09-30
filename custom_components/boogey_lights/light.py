@@ -68,6 +68,11 @@ class BoogeyCoordinator:
 
     def __init__(self, client: BoogeyClient) -> None:
         self.client = client
+        # State decisions and their controller transactions must be atomic.
+        # Two zones are commonly started in parallel by HA scenes; without
+        # this lock both could snapshot the other as OFF, and the transaction
+        # that ran second would disable the zone that had just started.
+        self._state_lock = asyncio.Lock()
         self.states = {
             CHANNEL_ALL: BoogeyState(),
             CHANNEL_1: BoogeyState(),
@@ -105,59 +110,62 @@ class BoogeyCoordinator:
         target.speed = source.speed
 
     async def async_turn_on(self, channel: int) -> None:
-        state = self.states[channel]
-        zone_1_on = True if channel in (CHANNEL_ALL, CHANNEL_1) else self.states[CHANNEL_1].is_on
-        zone_2_on = True if channel in (CHANNEL_ALL, CHANNEL_2) else self.states[CHANNEL_2].is_on
-        await self.client.turn_on_transaction(
-            channel=channel,
-            red=state.red,
-            green=state.green,
-            blue=state.blue,
-            brightness=state.brightness,
-            effect=state.effect,
-            speed=state.speed,
-            zone_1_on=zone_1_on,
-            zone_2_on=zone_2_on,
-        )
+        async with self._state_lock:
+            state = self.states[channel]
+            zone_1_on = True if channel in (CHANNEL_ALL, CHANNEL_1) else self.states[CHANNEL_1].is_on
+            zone_2_on = True if channel in (CHANNEL_ALL, CHANNEL_2) else self.states[CHANNEL_2].is_on
+            await self.client.turn_on_transaction(
+                channel=channel,
+                red=state.red,
+                green=state.green,
+                blue=state.blue,
+                brightness=state.brightness,
+                effect=state.effect,
+                speed=state.speed,
+                zone_1_on=zone_1_on,
+                zone_2_on=zone_2_on,
+            )
 
-        if channel == CHANNEL_ALL:
-            for zone_channel in (CHANNEL_1, CHANNEL_2):
-                zone_state = self.states[zone_channel]
-                self._copy_rgb_state(state, zone_state)
-                zone_state.is_on = True
-            state.is_on = True
-        else:
-            state.is_on = True
-            self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
-        self.notify()
+            if channel == CHANNEL_ALL:
+                for zone_channel in (CHANNEL_1, CHANNEL_2):
+                    zone_state = self.states[zone_channel]
+                    self._copy_rgb_state(state, zone_state)
+                    zone_state.is_on = True
+                state.is_on = True
+            else:
+                state.is_on = True
+                self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+            self.notify()
 
     async def async_update_rgb(self, channel: int) -> None:
-        state = self.states[channel]
-        await self.client.update_rgb_transaction(
-            channel=channel,
-            red=state.red,
-            green=state.green,
-            blue=state.blue,
-            brightness=state.brightness,
-            effect=state.effect,
-            speed=state.speed,
-        )
-        if channel == CHANNEL_ALL:
-            for zone_channel in (CHANNEL_1, CHANNEL_2):
-                self._copy_rgb_state(state, self.states[zone_channel])
-        self.notify()
+        async with self._state_lock:
+            state = self.states[channel]
+            await self.client.update_rgb_transaction(
+                channel=channel,
+                red=state.red,
+                green=state.green,
+                blue=state.blue,
+                brightness=state.brightness,
+                effect=state.effect,
+                speed=state.speed,
+            )
+            if channel == CHANNEL_ALL:
+                for zone_channel in (CHANNEL_1, CHANNEL_2):
+                    self._copy_rgb_state(state, self.states[zone_channel])
+            self.notify()
 
     async def async_turn_off(self, channel: int) -> None:
         self.cancel_pending(channel)
-        await self.client.turn_off_transaction(channel=channel)
-        if channel == CHANNEL_ALL:
-            self.states[CHANNEL_ALL].is_on = False
-            self.states[CHANNEL_1].is_on = False
-            self.states[CHANNEL_2].is_on = False
-        else:
-            self.states[channel].is_on = False
-            self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
-        self.notify()
+        async with self._state_lock:
+            await self.client.turn_off_transaction(channel=channel)
+            if channel == CHANNEL_ALL:
+                self.states[CHANNEL_ALL].is_on = False
+                self.states[CHANNEL_1].is_on = False
+                self.states[CHANNEL_2].is_on = False
+            else:
+                self.states[channel].is_on = False
+                self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+            self.notify()
 
 
 class BoogeyLight(LightEntity, RestoreEntity):
