@@ -7,8 +7,8 @@ from jinja2 import Environment, StrictUndefined
 import yaml
 
 PACKAGE = Path(__file__).parents[1] / "examples/mooterhome_boogey_shutdown.yaml"
-PATIO = "light.mooterhome_holiday_zone_patio"
-DRIVER = "light.mooterhome_holiday_zone_driver"
+PATIO = "light.patio_passenger_side"
+DRIVER = "light.patio_driver_side"
 
 
 class StopSequence(Exception):

@@ -58,8 +58,8 @@ async def main():
                 return [no_delays(v) for v in node]
             return node
 
-        patio = "light.mooterhome_holiday_zone_patio"
-        driver = "light.mooterhome_holiday_zone_driver"
+        patio = "light.patio_passenger_side"
+        driver = "light.patio_driver_side"
         for label, outcomes, reopen, expected_attempts, expected_alerts in [
             ("recover after failure", ["error", "off"], False, 2, 0),
             ("alert after three failures", ["error"] * 3, False, 3, 1),

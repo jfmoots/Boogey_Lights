@@ -3,6 +3,8 @@
 # branch with script.turn_on targeting script.mooterhome_holiday_boogey_shutdown.
 # Non-blocking invocation keeps duplicate scheduler triggers from cancelling
 # recovery and lets the other lighting participants shut down independently.
+# Confirmation must be read from the physical Boogey entities below. The
+# Holiday light groups do not forward custom integration attributes.
 script:
   mooterhome_holiday_boogey_shutdown:
     alias: Mooterhome Holiday - Verify Boogey Shutdown
@@ -33,10 +35,10 @@ script:
             - if: &both_off
                 - condition: template
                   value_template: >-
-                    {{ is_state('light.mooterhome_holiday_zone_patio', 'off')
-                       and is_state('light.mooterhome_holiday_zone_driver', 'off')
-                       and state_attr('light.mooterhome_holiday_zone_patio', 'command_confirmed') == true
-                       and state_attr('light.mooterhome_holiday_zone_driver', 'command_confirmed') == true }}
+                    {{ is_state('light.patio_passenger_side', 'off')
+                       and is_state('light.patio_driver_side', 'off')
+                       and state_attr('light.patio_passenger_side', 'command_confirmed') == true
+                       and state_attr('light.patio_driver_side', 'command_confirmed') == true }}
               then:
                 - action: persistent_notification.dismiss
                   data:
@@ -64,7 +66,7 @@ script:
           title: Boogey underglow shutdown needs attention
           message: >-
             Holiday lighting ended, but Boogey shutdown could not be confirmed
-            after three attempts. Passenger={{ states('light.mooterhome_holiday_zone_patio') }},
-            Driver={{ states('light.mooterhome_holiday_zone_driver') }}.
+            after three attempts. Passenger={{ states('light.patio_passenger_side') }},
+            Driver={{ states('light.patio_driver_side') }}.
             Check the lights and turn them off manually if needed. A successful
             Bluetooth write is command confirmation, not physical light feedback.
