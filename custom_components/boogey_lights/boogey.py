@@ -7,9 +7,11 @@ import time
 from dataclasses import dataclass
 
 from bleak import BleakClient
+from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 
 from .const import CMD_RGB, CMD_SYSTEM, HEADER, TAIL, WRITE_UUID
 
@@ -30,6 +32,8 @@ MAX_CONNECTION_AGE_SECONDS = 180.0
 # advertisement, but put one deadline around discovery, connect, retries, and
 # the GATT write so callers never hang indefinitely.
 COLD_CONNECT_TIMEOUT_SECONDS = 30.0
+OPERATION_TIMEOUT_SECONDS = 35.0
+DISCONNECT_TIMEOUT_SECONDS = 5.0
 DISCOVERY_POLL_SECONDS = 1.0
 WRITE_ATTEMPTS = 3
 # A successful GATT write only means the BLE packet was delivered. The GEN2
@@ -139,6 +143,10 @@ class BoogeyState:
     speed: int = 0
 
 
+class BoogeyCommunicationError(HomeAssistantError):
+    """An expected transport failure that HA scripts may safely handle."""
+
+
 class BoogeyClient:
     """Command client for Boogey Lights GEN2 controllers.
 
@@ -164,6 +172,7 @@ class BoogeyClient:
         self._startup_connect_task: asyncio.Task | None = None
         self._last_write_monotonic: float = 0.0
         self._connected_monotonic: float = 0.0
+        self._needs_disconnect = False
 
     def async_start(self) -> None:
         """Start a best-effort background BLE connection.
@@ -173,7 +182,9 @@ class BoogeyClient:
         the first HomeKit command is usually a write instead of a full connect.
         """
         if self._startup_connect_task is None or self._startup_connect_task.done():
-            self._startup_connect_task = self.hass.loop.create_task(self._startup_connect_worker())
+            self._startup_connect_task = self.hass.loop.create_task(
+                self._startup_connect_worker()
+            )
 
     async def _startup_connect_worker(self) -> None:
         try:
@@ -184,7 +195,9 @@ class BoogeyClient:
         except Exception as err:  # noqa: BLE001
             # Do not fail integration setup if the controller is temporarily out
             # of range. The next command will retry.
-            _LOGGER.info("Boogey startup BLE preconnect failed for %s: %s", self.address, err)
+            _LOGGER.info(
+                "Boogey startup BLE preconnect failed for %s: %s", self.address, err
+            )
 
     async def async_close(self) -> None:
         """Disconnect and cancel background tasks."""
@@ -211,12 +224,14 @@ class BoogeyClient:
             )
             if ble_device is not None:
                 if waiting_logged:
-                    _LOGGER.info("Boogey advertisement rediscovered for %s", self.address)
+                    _LOGGER.info(
+                        "Boogey advertisement rediscovered for %s", self.address
+                    )
                 return ble_device
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError(
+                raise BoogeyCommunicationError(
                     f"Boogey controller {self.address} did not advertise through a connectable "
                     f"Home Assistant Bluetooth adapter/proxy within "
                     f"{COLD_CONNECT_TIMEOUT_SECONDS:.0f} seconds"
@@ -231,6 +246,10 @@ class BoogeyClient:
             await asyncio.sleep(min(DISCOVERY_POLL_SECONDS, remaining))
 
     async def _ensure_connected(self, deadline: float | None = None) -> BleakClient:
+        if deadline is None:
+            deadline = time.monotonic() + COLD_CONNECT_TIMEOUT_SECONDS
+        if self._needs_disconnect:
+            await self._disconnect(deadline, reason="uncertain_previous_operation")
         if self._client is not None and self._client.is_connected:
             connection_age = time.monotonic() - self._connected_monotonic
             if connection_age < MAX_CONNECTION_AGE_SECONDS:
@@ -245,17 +264,25 @@ class BoogeyClient:
                 self.address,
                 connection_age,
             )
-            await self._disconnect()
-
-        if deadline is None:
-            deadline = time.monotonic() + COLD_CONNECT_TIMEOUT_SECONDS
+            await self._disconnect(deadline, reason="maximum_age")
 
         ble_device = await self._get_ble_device(deadline)
-        _LOGGER.info("Boogey connect address=%s device=%s", self.address, ble_device)
+        info = bluetooth.async_last_service_info(
+            self.hass, self.address, connectable=True
+        )
+        _LOGGER.info(
+            "Boogey connect address=%s source=%s rssi=%s device=%s",
+            self.address,
+            getattr(info, "source", None),
+            getattr(info, "rssi", None),
+            ble_device,
+        )
         start = time.monotonic()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(f"Boogey cold-connect deadline expired for {self.address}")
+            raise BoogeyCommunicationError(
+                f"Boogey cold-connect deadline expired for {self.address}"
+            )
         try:
             async with asyncio.timeout(remaining):
                 self._client = await establish_connection(
@@ -264,28 +291,52 @@ class BoogeyClient:
                     self.address,
                 )
         except TimeoutError as err:
-            raise RuntimeError(
+            raise BoogeyCommunicationError(
                 f"Boogey controller {self.address} did not connect within the bounded cold-connect window"
             ) from err
         self._connected_monotonic = time.monotonic()
-        _LOGGER.info("Boogey connected address=%s elapsed=%.2fs", self.address, time.monotonic() - start)
+        _LOGGER.info(
+            "Boogey connected address=%s elapsed=%.2fs",
+            self.address,
+            time.monotonic() - start,
+        )
         return self._client
 
-    async def _disconnect(self) -> None:
+    async def _disconnect(
+        self, deadline: float | None = None, *, reason: str = "cleanup"
+    ) -> None:
         client = self._client
-        self._client = None
-        self._connected_monotonic = 0.0
+        self._needs_disconnect = True
         if client is not None and client.is_connected:
             try:
-                _LOGGER.debug("Boogey %s disconnecting idle BLE connection", self.address)
-                await client.disconnect()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Boogey %s disconnect failed: %s", self.address, err)
+                remaining = DISCONNECT_TIMEOUT_SECONDS
+                if deadline is not None:
+                    remaining = min(remaining, max(0.0, deadline - time.monotonic()))
+                _LOGGER.info(
+                    "Boogey disconnect address=%s reason=%s", self.address, reason
+                )
+                async with asyncio.timeout(remaining):
+                    await client.disconnect()
+            except (TimeoutError, BleakError, OSError) as err:
+                _LOGGER.warning(
+                    "Boogey disconnect incomplete address=%s reason=%s error=%s",
+                    self.address,
+                    reason,
+                    err,
+                )
+                raise BoogeyCommunicationError(
+                    f"Boogey disconnect failed: {err}"
+                ) from err
+        self._client = None
+        self._connected_monotonic = 0.0
+        self._needs_disconnect = False
 
     def _schedule_idle_disconnect(self) -> None:
         if self._idle_disconnect_task is not None:
             self._idle_disconnect_task.cancel()
-        self._idle_disconnect_task = self.hass.loop.create_task(self._idle_disconnect_worker())
+        self._idle_disconnect_task = self.hass.loop.create_task(
+            self._idle_disconnect_worker()
+        )
 
     async def _idle_disconnect_worker(self) -> None:
         try:
@@ -293,24 +344,35 @@ class BoogeyClient:
             async with self._lock:
                 idle_for = time.monotonic() - self._last_write_monotonic
                 if idle_for >= IDLE_DISCONNECT_SECONDS:
-                    await self._disconnect()
+                    await self._disconnect(reason="idle")
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Boogey %s idle disconnect worker failed: %s", self.address, err)
+            _LOGGER.debug(
+                "Boogey %s idle disconnect worker failed: %s", self.address, err
+            )
 
-    async def _write_packet_locked(self, label: str, packet: bytes, deadline: float) -> None:
+    async def _write_packet_locked(
+        self, label: str, packet: bytes, deadline: float
+    ) -> None:
         client = await self._ensure_connected(deadline)
-        _LOGGER.debug("Boogey TX label=%s address=%s packet=%s", label, self.address, hexstr(packet))
+        _LOGGER.debug(
+            "Boogey TX label=%s address=%s packet=%s",
+            label,
+            self.address,
+            hexstr(packet),
+        )
         start = time.monotonic()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(f"Boogey write deadline expired for {self.address} / {label}")
+            raise BoogeyCommunicationError(
+                f"Boogey write deadline expired for {self.address} / {label}"
+            )
         try:
             async with asyncio.timeout(remaining):
                 await client.write_gatt_char(WRITE_UUID, packet, response=True)
         except TimeoutError as err:
-            raise RuntimeError(
+            raise BoogeyCommunicationError(
                 f"Boogey GATT write timed out for {self.address} / {label}"
             ) from err
         self._last_write_monotonic = time.monotonic()
@@ -329,7 +391,12 @@ class BoogeyClient:
                 try:
                     await self._write_packet_locked(label, packet, deadline)
                     return
-                except Exception as err:  # noqa: BLE001
+                except (
+                    BoogeyCommunicationError,
+                    BleakError,
+                    OSError,
+                    TimeoutError,
+                ) as err:
                     last_error = err
                     _LOGGER.warning(
                         "Boogey write attempt %s failed for %s / %s: %s",
@@ -338,14 +405,16 @@ class BoogeyClient:
                         label,
                         err,
                     )
-                    await self._disconnect()
+                    await self._disconnect(deadline, reason="write_failure")
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
                     await asyncio.sleep(min(0.25 * attempt, remaining))
 
             assert last_error is not None
-            raise last_error
+            raise BoogeyCommunicationError(
+                f"Boogey write failed for {label}: {last_error}"
+            ) from last_error
 
     async def set_power(self, on: bool) -> None:
         await self._write_packet("POWER_ON" if on else "POWER_OFF", power_packet(on))
@@ -381,33 +450,35 @@ class BoogeyClient:
             ),
         )
 
-    async def _run_transaction(self, label: str, steps: list[tuple[str, bytes]]) -> None:
-        """Run one logical controller operation without packet interleaving.
-
-        Home Assistant can cancel a script while it is waiting for a light
-        service. Once a controller transaction has started, finish it before
-        propagating cancellation so a partially applied ON sequence cannot be
-        left behind. A following shutdown will then run after it and win.
-        """
-
-        async def _worker() -> None:
-            async with self._operation_lock:
-                _LOGGER.debug("Boogey transaction start label=%s steps=%s", label, len(steps))
-                for index, (step_label, packet) in enumerate(steps):
-                    await self._write_packet(step_label, packet)
-                    if index < len(steps) - 1:
-                        await asyncio.sleep(INTER_PACKET_DELAY_SECONDS)
-                _LOGGER.debug("Boogey transaction complete label=%s", label)
-
-        task = self.hass.loop.create_task(_worker())
+    async def _run_transaction(
+        self, label: str, steps: list[tuple[str, bytes]]
+    ) -> None:
+        """Bound queueing and every packet; the coordinator owns cancellation."""
+        started = time.monotonic()
         try:
-            await asyncio.shield(task)
+            async with asyncio.timeout(OPERATION_TIMEOUT_SECONDS):
+                async with self._operation_lock:
+                    _LOGGER.debug(
+                        "Boogey transaction start label=%s steps=%s", label, len(steps)
+                    )
+                    for index, (step_label, packet) in enumerate(steps):
+                        await self._write_packet(step_label, packet)
+                        if index < len(steps) - 1:
+                            await asyncio.sleep(INTER_PACKET_DELAY_SECONDS)
+            _LOGGER.debug(
+                "Boogey transaction complete label=%s elapsed=%.2fs",
+                label,
+                time.monotonic() - started,
+            )
+        except (TimeoutError, BleakError, OSError) as err:
+            self._needs_disconnect = True
+            raise BoogeyCommunicationError(
+                f"Boogey transaction failed: {label}: {err}"
+            ) from err
         except asyncio.CancelledError:
-            _LOGGER.debug("Boogey caller cancelled; finishing transaction label=%s", label)
-            try:
-                await asyncio.shield(task)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Boogey transaction failed after caller cancellation label=%s: %s", label, err)
+            # A partially written transaction must not keep using a session
+            # with uncertain transport state. The next operation reconnects.
+            self._needs_disconnect = True
             raise
 
     async def turn_on_transaction(
@@ -456,7 +527,10 @@ class BoogeyClient:
                     f"RGB_{'ON' if zone_2_on else 'OFF'} ch=2 action=0x{rgb_enable_action(2, zone_2_on):02X}",
                     rgb_enable_packet(2, zone_2_on),
                 ),
-                (f"RGB ch={channel} normalized state", rgb_packet(channel=channel, **state_args)),
+                (
+                    f"RGB ch={channel} normalized state",
+                    rgb_packet(channel=channel, **state_args),
+                ),
             ]
 
         await self._run_transaction(f"TURN_ON ch={channel}", steps)
@@ -506,7 +580,10 @@ class BoogeyClient:
         else:
             action = rgb_enable_action(channel, False)
             steps = [
-                (f"RGB_OFF ch={channel} action=0x{action:02X}", rgb_enable_packet(channel, False)),
+                (
+                    f"RGB_OFF ch={channel} action=0x{action:02X}",
+                    rgb_enable_packet(channel, False),
+                ),
             ]
             label = f"TURN_OFF ch={channel}"
 

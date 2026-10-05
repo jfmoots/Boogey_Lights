@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import time
+from dataclasses import replace
 import logging
 
 from homeassistant.components.light import (
@@ -18,7 +19,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .boogey import BoogeyClient, BoogeyState
+from .boogey import (
+    BoogeyClient,
+    BoogeyState,
+    BoogeyCommunicationError,
+    OPERATION_TIMEOUT_SECONDS,
+)
 from .const import (
     CHANNEL_1,
     CHANNEL_2,
@@ -56,9 +62,23 @@ async def async_setup_entry(
     #   channel 2 = driver-side zone
     async_add_entities(
         [
-            BoogeyLight(coordinator, entry.entry_id, f"{base_name} All", CHANNEL_ALL, "all"),
-            BoogeyLight(coordinator, entry.entry_id, f"{base_name} {zone_1_name}", CHANNEL_1, "zone_1"),
-            BoogeyLight(coordinator, entry.entry_id, f"{base_name} {zone_2_name}", CHANNEL_2, "zone_2"),
+            BoogeyLight(
+                coordinator, entry.entry_id, f"{base_name} All", CHANNEL_ALL, "all"
+            ),
+            BoogeyLight(
+                coordinator,
+                entry.entry_id,
+                f"{base_name} {zone_1_name}",
+                CHANNEL_1,
+                "zone_1",
+            ),
+            BoogeyLight(
+                coordinator,
+                entry.entry_id,
+                f"{base_name} {zone_2_name}",
+                CHANNEL_2,
+                "zone_2",
+            ),
         ]
     )
 
@@ -79,6 +99,14 @@ class BoogeyCoordinator:
             CHANNEL_2: BoogeyState(),
         }
         self.entities: list[BoogeyLight] = []
+        self._generation = {CHANNEL_ALL: 0, CHANNEL_1: 0, CHANNEL_2: 0}
+        self.last_error: str | None = None
+        self.last_success: float | None = None
+        self.command_confirmed = {
+            CHANNEL_ALL: False,
+            CHANNEL_1: False,
+            CHANNEL_2: False,
+        }
 
     def register(self, entity: "BoogeyLight") -> None:
         self.entities.append(entity)
@@ -92,7 +120,7 @@ class BoogeyCoordinator:
 
     def cancel_pending(self, channel: int) -> None:
         for entity in self.entities:
-            if channel == CHANNEL_ALL or entity._channel == channel:
+            if channel == CHANNEL_ALL or entity._channel in (channel, CHANNEL_ALL):
                 entity._cancel_pending_rgb()
 
     def notify(self) -> None:
@@ -109,63 +137,155 @@ class BoogeyCoordinator:
         target.effect = source.effect
         target.speed = source.speed
 
-    async def async_turn_on(self, channel: int) -> None:
-        async with self._state_lock:
-            state = self.states[channel]
-            zone_1_on = True if channel in (CHANNEL_ALL, CHANNEL_1) else self.states[CHANNEL_1].is_on
-            zone_2_on = True if channel in (CHANNEL_ALL, CHANNEL_2) else self.states[CHANNEL_2].is_on
-            await self.client.turn_on_transaction(
-                channel=channel,
-                red=state.red,
-                green=state.green,
-                blue=state.blue,
-                brightness=state.brightness,
-                effect=state.effect,
-                speed=state.speed,
-                zone_1_on=zone_1_on,
-                zone_2_on=zone_2_on,
-            )
+    async def _execute(self, operation) -> None:
+        """Finish an active operation AND its state commit before cancellation.
 
+        A cancelled queued command must never wake the controller later. Once
+        started, its bounded worker owns the lock through the state commit.
+        Repeated cancellation cannot abandon that worker during shutdown.
+        """
+        started = False
+
+        async def worker():
+            nonlocal started
+            try:
+                async with asyncio.timeout(OPERATION_TIMEOUT_SECONDS):
+                    async with self._state_lock:
+                        started = True
+                        await operation()
+            except TimeoutError as err:
+                self.command_confirmed = dict.fromkeys(self.command_confirmed, False)
+                self.last_error = "Boogey operation timed out (including queue wait)"
+                self.notify()
+                raise BoogeyCommunicationError(self.last_error) from err
+            except BoogeyCommunicationError as err:
+                self.last_error = str(err)
+                self.notify()
+                raise
+
+        task = asyncio.create_task(worker())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+                if not started:
+                    task.cancel()
+            except Exception:
+                break
+        if cancelled:
+            if not task.cancelled():
+                # Retrieve a failed worker's exception without masking the
+                # caller's cancellation; the worker already recorded it.
+                task.exception()
+            raise asyncio.CancelledError
+        task.result()
+
+    async def async_apply(
+        self, channel: int, changes: dict, *, normalize: bool = False
+    ) -> None:
+        generation = self._generation[channel]
+        changes = dict(changes)
+
+        async def operation():
+            if generation != self._generation[channel]:
+                return  # An OFF superseded this queued scene/color command.
+            target = replace(self.states[channel], **changes)
+            args = dict(
+                channel=channel,
+                red=target.red,
+                green=target.green,
+                blue=target.blue,
+                brightness=target.brightness,
+                effect=target.effect,
+                speed=target.speed,
+            )
+            affected = (
+                (CHANNEL_1, CHANNEL_2, CHANNEL_ALL)
+                if channel == CHANNEL_ALL
+                else (channel, CHANNEL_ALL)
+            )
+            for zone in affected:
+                self.command_confirmed[zone] = False
+            try:
+                if normalize or not self.is_on(channel):
+                    await self.client.turn_on_transaction(
+                        **args,
+                        zone_1_on=channel in (CHANNEL_ALL, CHANNEL_1)
+                        or self.is_on(CHANNEL_1),
+                        zone_2_on=channel in (CHANNEL_ALL, CHANNEL_2)
+                        or self.is_on(CHANNEL_2),
+                    )
+                else:
+                    await self.client.update_rgb_transaction(**args)
+            except BaseException:
+                self.notify()
+                raise
+            self._copy_rgb_state(target, self.states[channel])
+            self.states[channel].is_on = True
             if channel == CHANNEL_ALL:
-                for zone_channel in (CHANNEL_1, CHANNEL_2):
-                    zone_state = self.states[zone_channel]
-                    self._copy_rgb_state(state, zone_state)
-                    zone_state.is_on = True
-                state.is_on = True
-            else:
-                state.is_on = True
-                self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+                for zone in (CHANNEL_1, CHANNEL_2):
+                    self._copy_rgb_state(target, self.states[zone])
+                    self.states[zone].is_on = True
+            self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+            self.command_confirmed[channel] = True
+            if channel == CHANNEL_ALL:
+                self.command_confirmed[CHANNEL_1] = self.command_confirmed[
+                    CHANNEL_2
+                ] = True
+            self.command_confirmed[CHANNEL_ALL] = all(
+                self.command_confirmed[z] for z in (CHANNEL_1, CHANNEL_2)
+            )
+            self.last_error = None
+            self.last_success = time.time()
             self.notify()
+
+        await self._execute(operation)
+
+    async def async_turn_on(self, channel: int) -> None:
+        await self.async_apply(channel, {}, normalize=True)
 
     async def async_update_rgb(self, channel: int) -> None:
-        async with self._state_lock:
-            state = self.states[channel]
-            await self.client.update_rgb_transaction(
-                channel=channel,
-                red=state.red,
-                green=state.green,
-                blue=state.blue,
-                brightness=state.brightness,
-                effect=state.effect,
-                speed=state.speed,
-            )
-            if channel == CHANNEL_ALL:
-                for zone_channel in (CHANNEL_1, CHANNEL_2):
-                    self._copy_rgb_state(state, self.states[zone_channel])
-            self.notify()
+        await self.async_apply(channel, {})
 
     async def async_turn_off(self, channel: int) -> None:
         self.cancel_pending(channel)
-        async with self._state_lock:
-            await self.client.turn_off_transaction(channel=channel)
-            if channel == CHANNEL_ALL:
-                self.states[CHANNEL_ALL].is_on = False
-                self.states[CHANNEL_1].is_on = False
-                self.states[CHANNEL_2].is_on = False
-            else:
-                self.states[channel].is_on = False
-                self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+        # Invalidate queued ONs for every target that overlaps this OFF.
+        for zone in (
+            (CHANNEL_ALL, CHANNEL_1, CHANNEL_2)
+            if channel == CHANNEL_ALL
+            else (channel, CHANNEL_ALL)
+        ):
+            self._generation[zone] += 1
+
+        async def operation():
+            affected = (
+                (CHANNEL_ALL, CHANNEL_1, CHANNEL_2)
+                if channel == CHANNEL_ALL
+                else (channel, CHANNEL_ALL)
+            )
+            for zone in affected:
+                self.command_confirmed[zone] = False
+            try:
+                await self.client.turn_off_transaction(channel=channel)
+            except BaseException:
+                self.notify()
+                raise
+            for zone in (
+                (CHANNEL_1, CHANNEL_2) if channel == CHANNEL_ALL else (channel,)
+            ):
+                self.states[zone].is_on = False
+                self.command_confirmed[zone] = True
+            self.states[CHANNEL_ALL].is_on = self.is_on(CHANNEL_ALL)
+            self.command_confirmed[CHANNEL_ALL] = all(
+                self.command_confirmed[z] for z in (CHANNEL_1, CHANNEL_2)
+            )
+            self.last_error = None
+            self.last_success = time.time()
             self.notify()
+
+        await self._execute(operation)
 
 
 class BoogeyLight(LightEntity, RestoreEntity):
@@ -190,7 +310,16 @@ class BoogeyLight(LightEntity, RestoreEntity):
         self._attr_unique_id = f"{entry_id}_{suffix}"
         self._pending_rgb_task: asyncio.Task | None = None
         self._pending_rgb_seq = 0
+        self._pending_rgb_changes: dict = {}
         coordinator.register(self)
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "command_confirmed": self._coordinator.command_confirmed[self._channel],
+            "last_transport_error": self._coordinator.last_error,
+            "last_successful_command": self._coordinator.last_success,
+        }
 
     @property
     def is_on(self) -> bool:
@@ -247,15 +376,16 @@ class BoogeyLight(LightEntity, RestoreEntity):
 
     def _cancel_pending_rgb(self) -> None:
         self._pending_rgb_seq += 1
+        self._pending_rgb_changes = {}
         if self._pending_rgb_task is not None:
             self._pending_rgb_task.cancel()
             self._pending_rgb_task = None
 
-    def _schedule_debounced_rgb(self) -> None:
-        self._pending_rgb_seq += 1
+    def _schedule_debounced_rgb(self, changes: dict) -> None:
+        pending = {**self._pending_rgb_changes, **changes}
+        self._cancel_pending_rgb()
+        self._pending_rgb_changes = pending
         seq = self._pending_rgb_seq
-        if self._pending_rgb_task is not None:
-            self._pending_rgb_task.cancel()
         self._pending_rgb_task = asyncio.create_task(self._debounced_rgb_worker(seq))
 
     async def _debounced_rgb_worker(self, seq: int) -> None:
@@ -263,91 +393,41 @@ class BoogeyLight(LightEntity, RestoreEntity):
             await asyncio.sleep(RGB_DEBOUNCE_SECONDS)
             if seq != self._pending_rgb_seq or not self.is_on:
                 return
-            await self._send_rgb_update("DEBOUNCED_RGB_STATE")
+            changes = self._pending_rgb_changes
+            self._pending_rgb_changes = {}
+            await self._coordinator.async_apply(self._channel, changes)
         except asyncio.CancelledError:
             raise
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Boogey debounced RGB send failed name=%s channel=%s: %s", self._attr_name, self._channel, err)
+        except BoogeyCommunicationError as err:
+            _LOGGER.warning(
+                "Boogey debounced RGB send failed name=%s channel=%s: %s",
+                self._attr_name,
+                self._channel,
+                err,
+            )
         finally:
             if seq == self._pending_rgb_seq:
                 self._pending_rgb_task = None
 
-    async def _send_on_transaction(self, reason: str) -> None:
-        _LOGGER.debug(
-            "Boogey entity send_rgb reason=%s name=%s channel=%s rgb=(%s,%s,%s) brightness=%s effect=%s speed=%s",
-            reason,
-            self._attr_name,
-            self._channel,
-            self._state.red,
-            self._state.green,
-            self._state.blue,
-            self._state.brightness,
-            self._state.effect,
-            self._state.speed,
-        )
-        await self._coordinator.async_turn_on(self._channel)
-
-    async def _send_rgb_update(self, reason: str) -> None:
-        _LOGGER.debug("Boogey entity RGB-only update reason=%s name=%s channel=%s", reason, self._attr_name, self._channel)
-        await self._coordinator.async_update_rgb(self._channel)
-
     async def async_turn_on(self, **kwargs) -> None:
-        was_off = not self.is_on
-
+        changes = {}
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs[ATTR_RGB_COLOR]
-            self._state.red = int(red)
-            self._state.green = int(green)
-            self._state.blue = int(blue)
-
+            changes.update(red=int(red), green=int(green), blue=int(blue))
         if ATTR_BRIGHTNESS in kwargs:
-            self._state.brightness = int(kwargs[ATTR_BRIGHTNESS])
-
+            changes["brightness"] = max(1, int(kwargs[ATTR_BRIGHTNESS]))
         if ATTR_EFFECT in kwargs:
-            self._state.effect = EFFECTS.get(kwargs[ATTR_EFFECT], 1)
-
-        if self._state.brightness <= 0:
-            self._state.brightness = 255
-
-        _LOGGER.debug(
-            "Boogey entity turn_on name=%s channel=%s was_off=%s kwargs=%s rgb=(%s,%s,%s) brightness=%s effect=%s",
-            self._attr_name,
-            self._channel,
-            was_off,
-            kwargs,
-            self._state.red,
-            self._state.green,
-            self._state.blue,
-            self._state.brightness,
-            self._state.effect,
-        )
-
-        if was_off or not kwargs:
-            # Every ON transaction explicitly wakes, enables, and programs the
-            # target. Never skip controller normalization based on restored HA
-            # state; the factory app/RF remote can change the real enable bits.
+            changes["effect"] = EFFECTS.get(kwargs[ATTR_EFFECT], 1)
+        if not self.is_on or not kwargs or ATTR_EFFECT in kwargs:
+            # Merge pending slider fields into this explicit request, without
+            # ever changing the successfully sent state before completion.
+            changes = {**self._pending_rgb_changes, **changes}
             self._cancel_pending_rgb()
-            await self._send_on_transaction("IMMEDIATE_NORMALIZED_TURN_ON")
-            return
-
-        # An explicit effect is typical of a scene/test button. Send its one
-        # RGB packet immediately. Color-wheel/slider streams still coalesce.
-        if ATTR_EFFECT in kwargs:
-            self._cancel_pending_rgb()
-            await self._send_rgb_update("IMMEDIATE_EXPLICIT_RGB_STATE")
-            return
-
-        self._schedule_debounced_rgb()
+            await self._coordinator.async_apply(
+                self._channel, changes, normalize=not kwargs
+            )
+        else:
+            self._schedule_debounced_rgb(changes)
 
     async def async_turn_off(self, **kwargs) -> None:
-        # OFF is high priority: cancel any queued color-wheel updates and send now.
-        self._coordinator.cancel_pending(self._channel)
-        _LOGGER.debug(
-            "Boogey entity turn_off name=%s channel=%s kwargs=%s",
-            self._attr_name,
-            self._channel,
-            kwargs,
-        )
-        # Individual zones use their proven RGB OFF action. All performs the
-        # complete deterministic shutdown, including master Power OFF.
         await self._coordinator.async_turn_off(self._channel)
