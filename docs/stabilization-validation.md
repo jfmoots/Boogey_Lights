@@ -41,7 +41,7 @@
   while a scene is active. Do not alter a shared Bluetooth proxy that other
   essential devices rely on. Confirm the scene continues after expected errors,
   confirmation becomes false, and later phases recover after reachability returns.
-- Repeat shutdown with an unreachable controller. Within roughly two minutes
+- Repeat shutdown with an unreachable controller. Within roughly three minutes on v1.1.6
   (three bounded commands plus short waits), HA should post one persistent
   notification. Restore reachability and rerun the shutdown script; successful
   recovery should dismiss it. This is an HA notification, not a phone push.
