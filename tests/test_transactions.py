@@ -12,6 +12,12 @@ import unittest
 bleak = types.ModuleType("bleak")
 bleak.BleakClient = object
 sys.modules.setdefault("bleak", bleak)
+bleak_exc = types.ModuleType("bleak.exc")
+bleak_exc.BleakError = type("BleakError", (Exception,), {})
+sys.modules.setdefault("bleak.exc", bleak_exc)
+ha_exceptions = types.ModuleType("homeassistant.exceptions")
+ha_exceptions.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
+sys.modules.setdefault("homeassistant.exceptions", ha_exceptions)
 
 retry = types.ModuleType("bleak_retry_connector")
 retry.establish_connection = None
@@ -38,6 +44,7 @@ light_component.ATTR_RGB_COLOR = "rgb_color"
 light_component.ColorMode = types.SimpleNamespace(RGB="rgb")
 light_component.LightEntity = type("LightEntity", (), {})
 light_component.LightEntityFeature = types.SimpleNamespace(EFFECT=1)
+bluetooth.async_last_service_info = lambda *args, **kwargs: None
 components.bluetooth = bluetooth
 sys.modules.setdefault("homeassistant", homeassistant)
 sys.modules.setdefault("homeassistant.components", components)
@@ -273,7 +280,9 @@ class ColdConnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_waits_for_fresh_advertisement(self) -> None:
         expected_device = object()
         discoveries = iter([None, None, expected_device])
-        bluetooth.async_ble_device_from_address = lambda *args, **kwargs: next(discoveries)
+        bluetooth.async_ble_device_from_address = lambda *args, **kwargs: next(
+            discoveries
+        )
 
         device = await self.client._get_ble_device(time.monotonic() + 1)
 
@@ -282,7 +291,9 @@ class ColdConnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_discovery_wait_has_a_deadline(self) -> None:
         bluetooth.async_ble_device_from_address = lambda *args, **kwargs: None
 
-        with self.assertRaisesRegex(RuntimeError, "did not advertise"):
+        with self.assertRaisesRegex(
+            boogey.BoogeyCommunicationError, "did not advertise"
+        ):
             await self.client._get_ble_device(time.monotonic())
 
 

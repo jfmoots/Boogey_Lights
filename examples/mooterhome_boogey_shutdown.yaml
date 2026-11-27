@@ -1,0 +1,72 @@
+# HA package for the Mooterhome Holiday Lighting installation. Requires 1.1.5.
+# In mooterhome_holiday_participants_all_off, replace only the Boogey light
+# branch with script.turn_on targeting script.mooterhome_holiday_boogey_shutdown.
+# Non-blocking invocation keeps duplicate scheduler triggers from cancelling
+# recovery and lets the other lighting participants shut down independently.
+# Confirmation must be read from the physical Boogey entities below. The
+# Holiday light groups do not forward custom integration attributes.
+script:
+  mooterhome_holiday_boogey_shutdown:
+    alias: Mooterhome Holiday - Verify Boogey Shutdown
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - delay: "00:00:02"
+      - repeat:
+          count: 3
+          sequence:
+            # A newly opened show supersedes recovery from an earlier shutdown.
+            - if: &show_reopened
+                - condition: template
+                  value_template: >-
+                    {{ is_state('input_boolean.mooterhome_holiday_enabled', 'on')
+                       and is_state('input_boolean.mooterhome_holiday_window_active', 'on')
+                       and not is_state('input_select.mooterhome_holiday_theme', 'Off') }}
+              then:
+                - action: persistent_notification.dismiss
+                  data:
+                    notification_id: mooterhome_boogey_shutdown_failed
+                - stop: A new holiday show superseded this shutdown
+            - continue_on_error: true
+              action: light.turn_off
+              target:
+                entity_id: light.patio_underglow
+            - delay: "00:00:02"
+            - if: &both_off
+                - condition: template
+                  value_template: >-
+                    {{ is_state('light.patio_passenger_side', 'off')
+                       and is_state('light.patio_driver_side', 'off')
+                       and state_attr('light.patio_passenger_side', 'command_confirmed') == true
+                       and state_attr('light.patio_driver_side', 'command_confirmed') == true }}
+              then:
+                - action: persistent_notification.dismiss
+                  data:
+                    notification_id: mooterhome_boogey_shutdown_failed
+                - stop: Both zones accepted the shutdown command
+            - if:
+                - condition: template
+                  value_template: "{{ repeat.index < 3 }}"
+              then:
+                - delay: "00:00:10"
+      # Check again after the last attempt so a newly opened show or a manual
+      # successful OFF does not produce an obsolete failure notification.
+      - if: *show_reopened
+        then:
+          - stop: A new holiday show superseded this shutdown
+      - if: *both_off
+        then:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: mooterhome_boogey_shutdown_failed
+          - stop: Both zones accepted the shutdown command
+      - action: persistent_notification.create
+        data:
+          notification_id: mooterhome_boogey_shutdown_failed
+          title: Boogey underglow shutdown needs attention
+          message: >-
+            Holiday lighting ended, but Boogey shutdown could not be confirmed
+            after three attempts. Passenger={{ states('light.patio_passenger_side') }},
+            Driver={{ states('light.patio_driver_side') }}.
+            Check the lights and turn them off manually if needed. A successful
+            Bluetooth write is command confirmation, not physical light feedback.
