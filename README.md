@@ -148,6 +148,17 @@ claiming to have read the controller.
 
 ---
 
+## Version 1.1.6
+
+Gives cold Bluetooth commands up to 45 seconds across discovery, connection,
+retries, and the first write. The complete operation has a 50-second limit,
+including queueing. Commands on an open connection complete as soon as
+their writes finish.
+
+See [release notes](RELEASE_NOTES_v1.1.6.md).
+
+---
+
 ## Version 1.1.5
 
 Contains expected Bluetooth failures without aborting HA scripts, bounds complete
