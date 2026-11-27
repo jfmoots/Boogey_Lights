@@ -31,8 +31,10 @@ MAX_CONNECTION_AGE_SECONDS = 180.0
 # connectable-device cache at the instant a command arrives. Wait for a fresh
 # advertisement, but put one deadline around discovery, connect, retries, and
 # the GATT write so callers never hang indefinitely.
-COLD_CONNECT_TIMEOUT_SECONDS = 30.0
-OPERATION_TIMEOUT_SECONDS = 35.0
+# Slow BLE handshakes can take about 30 seconds. Leave room for discovery
+# and the first write, plus time to finish the multi-packet operation.
+COLD_CONNECT_TIMEOUT_SECONDS = 45.0
+OPERATION_TIMEOUT_SECONDS = 50.0
 DISCONNECT_TIMEOUT_SECONDS = 5.0
 DISCOVERY_POLL_SECONDS = 1.0
 WRITE_ATTEMPTS = 3
